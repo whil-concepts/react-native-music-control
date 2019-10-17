@@ -15,6 +15,10 @@
 
 #define MEDIA_STATE_PLAYING @"STATE_PLAYING"
 #define MEDIA_STATE_PAUSED @"STATE_PAUSED"
+#define MEDIA_STATE_STOPPED @"STATE_STOPPED"
+#define MEDIA_STATE_ERROR @"STATE_ERROR"
+#define MEDIA_STATE_BUFFERING @"STATE_BUFFERING"
+#define MEDIA_STATE_RATING_PERCENTAGE @"STATE_RATING_PERCENTAGE"
 #define MEDIA_SPEED @"speed"
 #define MEDIA_STATE @"state"
 #define MEDIA_DICT @{@"album": MPMediaItemPropertyAlbumTitle, \
@@ -46,7 +50,11 @@ RCT_EXPORT_MODULE()
 {
     return @{
         @"STATE_PLAYING": MEDIA_STATE_PLAYING,
-        @"STATE_PAUSED": MEDIA_STATE_PAUSED
+        @"STATE_PAUSED": MEDIA_STATE_PAUSED,
+        @"STATE_STOPPED" : MEDIA_STATE_STOPPED,
+        @"STATE_ERROR" :MEDIA_STATE_ERROR,
+        @"STATE_BUFFERING":MEDIA_STATE_BUFFERING,
+        @"STATE_RATING_PERCENTAGE":MEDIA_STATE_RATING_PERCENTAGE,
     };
 }
 
@@ -64,26 +72,39 @@ RCT_EXPORT_METHOD(updatePlayback:(NSDictionary *) originalDetails)
     }
 
     NSMutableDictionary *details = [originalDetails mutableCopy];
+    NSString *state = [details objectForKey:MEDIA_STATE];
 
     // Set the playback rate from the state if no speed has been defined
     // If they provide the speed, then use it
-    if ([details objectForKey:MEDIA_STATE] != nil && [details objectForKey:MEDIA_SPEED] == nil) {
-        NSNumber *speed = [[details objectForKey:MEDIA_STATE] isEqual:MEDIA_STATE_PAUSED]
+    if (state != nil && [details objectForKey:MEDIA_SPEED] == nil) {
+        NSNumber *speed = [state isEqual:MEDIA_STATE_PAUSED]
         ? [NSNumber numberWithDouble:0]
         : [NSNumber numberWithDouble:1];
 
         [details setValue:speed forKey:MEDIA_SPEED];
+    }
+    if ([state isEqual:MEDIA_STATE_STOPPED]) {
+        MPRemoteCommandCenter *remoteCenter = [MPRemoteCommandCenter sharedCommandCenter];
+        [self toggleHandler:remoteCenter.stopCommand withSelector:@selector(onStop:) enabled:false];
     }
 
     NSMutableDictionary *mediaDict = [[NSMutableDictionary alloc] initWithDictionary: center.nowPlayingInfo];
 
     center.nowPlayingInfo = [self update:mediaDict with:details andSetDefaults:false];
 
-    NSString *artworkUrl = [self getArtworkUrl:[originalDetails objectForKey:@"artwork"]];
-    if (artworkUrl != self.artworkUrl) {
-        self.artworkUrl = artworkUrl;
-        [self updateArtworkIfNeeded:artworkUrl];
+    // Playback state is separated in 11+
+    if (@available(iOS 11.0, *)) {
+        if ([state isEqual:MEDIA_STATE_PLAYING]) {
+            center.playbackState = MPNowPlayingPlaybackStatePlaying;
+        } else if ([state isEqual:MEDIA_STATE_PAUSED]) {
+            center.playbackState = MPNowPlayingPlaybackStatePaused;
+        } else if ([state isEqual:MEDIA_STATE_STOPPED]) {
+            center.playbackState = MPNowPlayingPlaybackStateStopped;
+        }
     }
+
+    NSString *artworkUrl = [self getArtworkUrl:[originalDetails objectForKey:@"artwork"]];
+    [self updateArtworkIfNeeded:artworkUrl];
 }
 
 
@@ -208,6 +229,7 @@ RCT_EXPORT_METHOD(observeAudioInterruptions:(BOOL) observe){
 - (id)init {
     self = [super init];
     [[NSNotificationCenter defaultCenter] addObserver:self selector:@selector(audioHardwareRouteChanged:) name:AVAudioSessionRouteChangeNotification object:nil];
+    [[UIApplication sharedApplication] beginReceivingRemoteControlEvents];
     self.audioInterruptionsObserved = false;
     return self;
 }
@@ -285,54 +307,66 @@ RCT_EXPORT_METHOD(observeAudioInterruptions:(BOOL) observe){
 
 - (void)updateArtworkIfNeeded:(id)artworkUrl
 {
-    if (artworkUrl != nil) {
-        self.artworkUrl = artworkUrl;
+    if( artworkUrl == nil ) {
+        return;
+    }
 
-        // Custom handling of artwork in another thread, will be loaded async
-        dispatch_async(dispatch_get_global_queue(DISPATCH_QUEUE_PRIORITY_BACKGROUND, 0), ^{
-            UIImage *image = nil;
+    MPNowPlayingInfoCenter *center = [MPNowPlayingInfoCenter defaultCenter];
+    if ([artworkUrl isEqualToString:self.artworkUrl] && [center.nowPlayingInfo objectForKey:MPMediaItemPropertyArtwork] != nil) {
+        return;
+    }
 
-            // check whether artwork path is present
-            if (![artworkUrl isEqual: @""]) {
-                // artwork is url download from the interwebs
-                if ([artworkUrl hasPrefix: @"http://"] || [artworkUrl hasPrefix: @"https://"]) {
-                    NSURL *imageURL = [NSURL URLWithString:artworkUrl];
-                    NSData *imageData = [NSData dataWithContentsOfURL:imageURL];
-                    image = [UIImage imageWithData:imageData];
-                } else {
-                    // artwork is local. so create it from a UIImage
-                    BOOL fileExists = [[NSFileManager defaultManager] fileExistsAtPath:artworkUrl];
-                    if (fileExists) {
-                        image = [UIImage imageNamed:artworkUrl];
-                    }
-                }
+    self.artworkUrl = artworkUrl;
+
+    // Custom handling of artwork in another thread, will be loaded async
+    dispatch_async(dispatch_get_global_queue(DISPATCH_QUEUE_PRIORITY_BACKGROUND, 0), ^{
+        UIImage *image = nil;
+
+        // check whether artwork path is present
+        if ([artworkUrl isEqual: @""]) {
+            return;
+        }
+
+        // artwork is url download from the interwebs
+        if ([artworkUrl hasPrefix: @"http://"] || [artworkUrl hasPrefix: @"https://"]) {
+            NSURL *imageURL = [NSURL URLWithString:artworkUrl];
+            NSData *imageData = [NSData dataWithContentsOfURL:imageURL];
+            image = [UIImage imageWithData:imageData];
+        } else {
+            NSString *localArtworkUrl = [artworkUrl stringByReplacingOccurrencesOfString:@"file://" withString:@""];
+            BOOL fileExists = [[NSFileManager defaultManager] fileExistsAtPath:localArtworkUrl];
+            if (fileExists) {
+                image = [UIImage imageNamed:localArtworkUrl];
             }
+        }
 
-            // Check if image was available otherwise don't do anything
-            if (image == nil) {
+        // Check if image was available otherwise don't do anything
+        if (image == nil) {
+            return;
+        }
+
+        // check whether image is loaded
+        CGImageRef cgref = [image CGImage];
+        CIImage *cim = [image CIImage];
+
+        if (cim == nil && cgref == NULL) {
+            return;
+        }
+
+        dispatch_async(dispatch_get_main_queue(), ^{
+
+            // Check if URL wasn't changed in the meantime
+            if (![artworkUrl isEqual:self.artworkUrl]) {
                 return;
             }
 
-            // check whether image is loaded
-            CGImageRef cgref = [image CGImage];
-            CIImage *cim = [image CIImage];
-
-            if (cim != nil || cgref != NULL) {
-
-                dispatch_async(dispatch_get_main_queue(), ^{
-
-                    // Check if URL wasn't changed in the meantime
-                    if ([artworkUrl isEqual:self.artworkUrl]) {
-                        MPNowPlayingInfoCenter *center = [MPNowPlayingInfoCenter defaultCenter];
-                        MPMediaItemArtwork *artwork = [[MPMediaItemArtwork alloc] initWithImage: image];
-                        NSMutableDictionary *mediaDict = (center.nowPlayingInfo != nil) ? [[NSMutableDictionary alloc] initWithDictionary: center.nowPlayingInfo] : [NSMutableDictionary dictionary];
-                        [mediaDict setValue:artwork forKey:MPMediaItemPropertyArtwork];
-                        center.nowPlayingInfo = mediaDict;
-                    }
-                });
-            }
+            MPNowPlayingInfoCenter *center = [MPNowPlayingInfoCenter defaultCenter];
+            MPMediaItemArtwork *artwork = [[MPMediaItemArtwork alloc] initWithImage: image];
+            NSMutableDictionary *mediaDict = (center.nowPlayingInfo != nil) ? [[NSMutableDictionary alloc] initWithDictionary: center.nowPlayingInfo] : [NSMutableDictionary dictionary];
+            [mediaDict setValue:artwork forKey:MPMediaItemPropertyArtwork];
+            center.nowPlayingInfo = mediaDict;
         });
-    }
+    });
 }
 
 - (void)audioHardwareRouteChanged:(NSNotification *)notification {
@@ -349,8 +383,9 @@ RCT_EXPORT_METHOD(observeAudioInterruptions:(BOOL) observe){
     }
     NSInteger interruptionType = [notification.userInfo[AVAudioSessionInterruptionTypeKey] integerValue];
     NSInteger interruptionOption = [notification.userInfo[AVAudioSessionInterruptionOptionKey] integerValue];
+    bool delayedSuspendedNotification = (@available(iOS 10.0, *)) && [notification.userInfo[AVAudioSessionInterruptionWasSuspendedKey] boolValue];
 
-    if (interruptionType == AVAudioSessionInterruptionTypeBegan) {
+    if (interruptionType == AVAudioSessionInterruptionTypeBegan && !delayedSuspendedNotification) {
         // Playback interrupted by an incoming phone call.
         [self sendEvent:@"pause"];
     }
