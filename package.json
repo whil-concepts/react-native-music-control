@@ -32,7 +32,8 @@
     "prepack": "tsc -p tsconfig.json",
     "start": "tsc -p tsconfig.json -w",
     "test": "echo 'no tests'",
-    "semantic-release:ci": "semantic-release --no-ci"
+    "semantic-release:ci": "semantic-release --no-ci",
+    "postinstall": "npm run prepack"
   },
   "rnpm": {},
   "devDependencies": {
